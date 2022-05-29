@@ -842,6 +842,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
+      printf("Line 839:Write Addr into the LAQ, with addr %x.\n",ldq(ldq_idx).bits.addr.bits )
 
       assert(!(will_fire_load_incoming(w) && ldq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming load is overwriting a valid address")
@@ -856,6 +857,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
       stq(stq_idx).bits.addr_is_virtual := exe_tlb_miss(w)
+      printf("Line 860:Write Addr into the SAQ, with addr %x.\n",stq(stq_idx).bits.addr.bits)
 
       assert(!(will_fire_sta_incoming(w) && stq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming store is overwriting a valid address")
@@ -876,6 +878,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq(sidx).bits.data.bits  := Mux(will_fire_std_incoming(w) || will_fire_stad_incoming(w),
         exe_req(w).bits.data,
         io.core.fp_stdata.bits.data)
+
+      printf("Line 882: Write data into the STQ, with data being: %x.\n", stq(sidx).bits.data.bits)
+
       assert(!(stq(sidx).bits.data.valid),
         "[lsu] Incoming store is overwriting a valid data entry")
     }
@@ -1107,8 +1112,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // We are older than this load, which overlapped us.
         when (!l_bits.forward_std_val || // If the load wasn't forwarded, it definitely failed
           ((l_forward_stq_idx =/= lcam_stq_idx(w)) && forwarded_is_older)) { // If the load forwarded from us, we might be ok
-          ldq(i).bits.order_fail := true.B
-          failed_loads(i)        := true.B
+          //SM: allow LD-ST,arch3
+          // ldq(i).bits.order_fail := true.B
+          // failed_loads(i)        := true.B
         }
       } .elsewhen (do_ld_search(w)            &&
                    l_valid                    &&
@@ -1121,6 +1127,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           when ((l_bits.executed || l_bits.succeeded || l_is_forwarding) &&
                 !s1_executing_loads(i) && // If the load is proceeding in parallel we don't need to kill it
                 l_bits.observed) {        // Its only a ordering failure if the cache line was observed between the younger load and us
+            //SM: probably LD-LD detect,arch3
             ldq(i).bits.order_fail := true.B
             failed_loads(i)        := true.B
           }
@@ -1150,6 +1157,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       when (do_ld_search(w) && stq(i).valid && lcam_st_dep_mask(w)(i)) {
         when (((lcam_mask(w) & write_mask) === lcam_mask(w)) && !s_uop.is_fence && dword_addr_matches(w) && can_forward(w))
         {
+          printf("Line 1158: ldst_forward_matches set to TRUE. \n")
           ldst_addr_matches(w)(i)            := true.B
           ldst_forward_matches(w)(i)         := true.B
           io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
@@ -1342,12 +1350,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
 
 
+    // SM: disable forwarding to observe effect on memory model
     when (dmem_resp_fired(w) && wb_forward_valid(w))
     {
+      printf("Line 1353: an't forward because dcache response takes precedence.\n")
       // Twiddle thumbs. Can't forward because dcache response takes precedence
     }
       .elsewhen (!dmem_resp_fired(w) && wb_forward_valid(w))
     {
+      printf("Line 1352 reached with forwarding.\n")
+      printf("Line 1353: wb_forward_ldq_idx is %d\n", wb_forward_ldq_idx(w))
+      printf("Line 1353: wb_forward_stq_idx is %d\n", wb_forward_stq_idx(w))
       val f_idx       = wb_forward_ldq_idx(w)
       val forward_uop = ldq(f_idx).bits.uop
       val stq_e       = stq(wb_forward_stq_idx(w))
@@ -1369,6 +1382,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       io.core.exe(w).fresp.bits.data := loadgen.data
 
       when (data_ready && live) {
+        printf("Line 1374: forward Succeeded with f_idx %d.\n",f_idx)
         ldq(f_idx).bits.succeeded := data_ready
         ldq(f_idx).bits.forward_std_val := true.B
         ldq(f_idx).bits.forward_stq_idx := wb_forward_stq_idx(w)
@@ -1456,6 +1470,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (commit_store)
     {
       stq(idx).bits.committed := true.B
+      printf("Line 1464: finish deque store queue.\n")
     } .elsewhen (commit_load) {
       assert (ldq(idx).valid, "[lsu] trying to commit an un-allocated load entry.")
       assert ((ldq(idx).bits.executed || ldq(idx).bits.forward_std_val) && ldq(idx).bits.succeeded ,
@@ -1467,6 +1482,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(idx).bits.succeeded        := false.B
       ldq(idx).bits.order_fail       := false.B
       ldq(idx).bits.forward_std_val  := false.B
+      printf("Line 1475: finish deque load queue.\n")
 
     }
 
