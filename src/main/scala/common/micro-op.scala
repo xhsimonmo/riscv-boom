@@ -77,6 +77,9 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val rob_idx          = UInt(robAddrSz.W)
   val ldq_idx          = UInt(ldqAddrSz.W)
   val stq_idx          = UInt(stqAddrSz.W)
+  //added custom index for ld/st buffer
+  val buf_idx          = UInt(stqAddrSz.W)
+
   val rxq_idx          = UInt(log2Ceil(numRxqEntries).W)
   val pdst             = UInt(maxPregSz.W)
   val prs1             = UInt(maxPregSz.W)

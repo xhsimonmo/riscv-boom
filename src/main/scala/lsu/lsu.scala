@@ -113,8 +113,11 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val exe = Vec(memWidth, new LSUExeIO)
 
   val dis_uops    = Flipped(Vec(coreWidth, Valid(new MicroOp)))
-  val dis_ldq_idx = Output(Vec(coreWidth, UInt(ldqAddrSz.W)))
-  val dis_stq_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
+  // val dis_ldq_idx = Output(Vec(coreWidth, UInt(ldqAddrSz.W)))
+  // val dis_stq_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
+
+  //SM: dispatch index for buffer
+  val dis_buf_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
 
   val ldq_full    = Output(Vec(coreWidth, Bool()))
   val stq_full    = Output(Vec(coreWidth, Bool()))
@@ -200,30 +203,37 @@ class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val debug_wb_data       = UInt(xLen.W)
 }
 
+//SM: the buffer to hold both load and store in issue order
+class BufferEntry(implicit p: Parameters) extends BoomBundle()(p)
+   with HasBoomUOP
+{
+  val is_ld = Bool() //each valid entry is either load or store
+  val ld = Valid(new LDQEntry)
+  val st = Valid(new STQEntry)
+}
+
 class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   with rocket.HasL1HellaCacheParameters
 {
   val io = IO(new LSUIO)
 
 
-  val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
-  val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
+  // val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
+  // val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
+  val buffer = Reg(Vec(numStqEntries * 2, Valid(new BufferEntry)))
 
+  // val ldq_head         = Reg(UInt(ldqAddrSz.W))
+  // val ldq_tail         = Reg(UInt(ldqAddrSz.W))
+  // val stq_head         = Reg(UInt(stqAddrSz.W)) // point to next store to clear from STQ (i.e., send to memory)
+  // val stq_tail         = Reg(UInt(stqAddrSz.W))
+  // val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
+  // val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
 
-
-  val ldq_head         = Reg(UInt(ldqAddrSz.W))
-  val ldq_tail         = Reg(UInt(ldqAddrSz.W))
-  val stq_head         = Reg(UInt(stqAddrSz.W)) // point to next store to clear from STQ (i.e., send to memory)
-  val stq_tail         = Reg(UInt(stqAddrSz.W))
-  val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
-  val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
-
+  val buf_head         = Reg(UInt(ldqAddrSz.W))
+  val buf_tail         = Reg(UInt(ldqAddrSz.W))
 
   // If we got a mispredict, the tail will be misaligned for 1 extra cycle
-  assert (io.core.brupdate.b2.mispredict ||
-          stq(stq_execute_head).valid ||
-          stq_head === stq_execute_head ||
-          stq_tail === stq_execute_head,
+  assert (io.core.brupdate.b2.mispredict,
             "stq_execute_head got off track.")
 
   val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_wait :: h_replay :: h_dead :: Nil = Enum(7)
@@ -254,11 +264,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.perf.release := io.dmem.perf.release
 
 
-
-  val clear_store     = WireInit(false.B)
-  val live_store_mask = RegInit(0.U(numStqEntries.W))
-  var next_live_store_mask = Mux(clear_store, live_store_mask & ~(1.U << stq_head),
-                                              live_store_mask)
+  // val clear_store     = WireInit(false.B)
+  // val live_store_mask = RegInit(0.U(numStqEntries.W))
+  // var next_live_store_mask = Mux(clear_store, live_store_mask & ~(1.U << stq_head),
+  //                                             live_store_mask)
 
 
   def widthMap[T <: Data](f: Int => T) = VecInit((0 until memWidth).map(f))
@@ -271,81 +280,98 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //-------------------------------------------------------------
 
   // This is a newer store than existing loads, so clear the bit in all the store dependency masks
-  for (i <- 0 until numLdqEntries)
-  {
-    when (clear_store)
-    {
-      ldq(i).bits.st_dep_mask := ldq(i).bits.st_dep_mask & ~(1.U << stq_head)
-    }
-  }
+  // for (i <- 0 until numLdqEntries)
+  // {
+  //   when (clear_store)
+  //   {
+  //     ldq(i).bits.st_dep_mask := ldq(i).bits.st_dep_mask & ~(1.U << stq_head)
+  //   }
+  // }
 
   // Decode stage
-  var ld_enq_idx = ldq_tail
-  var st_enq_idx = stq_tail
+  //SM:
+  // var ld_enq_idx = ldq_tail
+  // var st_enq_idx = stq_tail
+  var buf_enq_idx = buf_tail
 
-  val stq_nonempty = (0 until numStqEntries).map{ i => stq(i).valid }.reduce(_||_) =/= 0.U
+  // val stq_nonempty = (0 until numStqEntries).map{ i => stq(i).valid }.reduce(_||_) =/= 0.U
+  val buf_nonempty = (0 until numStqEntries).map{ i => buf(i).valid }.reduce(_||_) =/= 0.U
 
-  var ldq_full = Bool()
-  var stq_full = Bool()
+  // var ldq_full = Bool()
+  // var stq_full = Bool()
+
+  var buf_full = Bool()
 
   for (w <- 0 until coreWidth)
   {
-    ldq_full = WrapInc(ld_enq_idx, numLdqEntries) === ldq_head
-    io.core.ldq_full(w)    := ldq_full
-    io.core.dis_ldq_idx(w) := ld_enq_idx
+    // ldq_full = WrapInc(ld_enq_idx, numLdqEntries) === ldq_head
+    // io.core.ldq_full(w)    := ldq_full
+    // io.core.dis_ldq_idx(w) := ld_enq_idx
 
-    stq_full = WrapInc(st_enq_idx, numStqEntries) === stq_head
-    io.core.stq_full(w)    := stq_full
-    io.core.dis_stq_idx(w) := st_enq_idx
+    // stq_full = WrapInc(st_enq_idx, numStqEntries) === stq_head
+    // io.core.stq_full(w)    := stq_full
+    // io.core.dis_stq_idx(w) := st_enq_idx
+
+    buf_full = WrapInc(buf_enq_idx, numLdqEntries) === buf_head
+    // io.core.dis_ldq_idx(w) := buf_enq_idx
+    // io.core.dis_stq_idx(w) := buf_enq_idx
+    io.core.dis_buf_idx(w) := buf_enq_idx
 
     val dis_ld_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception
     val dis_st_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
     when (dis_ld_val)
     {
-      ldq(ld_enq_idx).valid                := true.B
-      ldq(ld_enq_idx).bits.uop             := io.core.dis_uops(w).bits
-      ldq(ld_enq_idx).bits.youngest_stq_idx  := st_enq_idx
-      ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
+      buf(buf_enq_idx).valid                        := true.B 
+      buf(buf_enq_idx).bits.is_ld                   := true.B 
+      buf(buf_enq_idx).bits.ld.valid                := true.B
+      buf(buf_enq_idx).bits.ld.bits.uop             := io.core.dis_uops(w).bits
+      buf(buf_enq_idx).bits.ld.bits.youngest_stq_idx  := st_enq_idx
+      buf(buf_enq_idx).bits.ld.bits.st_dep_mask     := next_live_store_mask
 
-      ldq(ld_enq_idx).bits.addr.valid      := false.B
-      ldq(ld_enq_idx).bits.executed        := false.B
-      ldq(ld_enq_idx).bits.succeeded       := false.B
-      ldq(ld_enq_idx).bits.order_fail      := false.B
-      ldq(ld_enq_idx).bits.observed        := false.B
-      ldq(ld_enq_idx).bits.forward_std_val := false.B
+      buf(buf_enq_idx).bits.ld.bits.addr.valid      := false.B
+      buf(buf_enq_idx).bits.ld.bits.executed        := false.B
+      buf(buf_enq_idx).bits.ld.bits.succeeded       := false.B
+      buf(buf_enq_idx).bits.ld.bits.order_fail      := false.B
+      buf(buf_enq_idx).bits.ld.bits.observed        := false.B
+      buf(buf_enq_idx).bits.ld.bits.forward_std_val := false.B
 
-      assert (ld_enq_idx === io.core.dis_uops(w).bits.ldq_idx, "[lsu] mismatch enq load tag.")
-      assert (!ldq(ld_enq_idx).valid, "[lsu] Enqueuing uop is overwriting ldq entries")
+      assert (buf_enq_idx === io.core.dis_uops(w).bits.ldq_idx, "[lsu] mismatch enq load tag.")
+      assert (!buf(buf_enq_idx).bits.ld.valid, "[lsu] Enqueuing uop is overwriting ldq entries")
     }
       .elsewhen (dis_st_val)
     {
-      stq(st_enq_idx).valid           := true.B
-      stq(st_enq_idx).bits.uop        := io.core.dis_uops(w).bits
-      stq(st_enq_idx).bits.addr.valid := false.B
-      stq(st_enq_idx).bits.data.valid := false.B
-      stq(st_enq_idx).bits.committed  := false.B
-      stq(st_enq_idx).bits.succeeded  := false.B
+      buf(buf_enq_idx).valid                   := true.B 
+      buf(buf_enq_idx).bits.is_ld              := false.B 
+      buf(buf_enq_idx).bits.st.valid           := true.B
+      buf(buf_enq_idx).bits.st.bits.uop        := io.core.dis_uops(w).bits
+      buf(buf_enq_idx).bits.st.bits.addr.valid := false.B
+      buf(buf_enq_idx).bits.st.bits.data.valid := false.B
+      buf(buf_enq_idx).bits.st.bits.committed  := false.B
+      buf(buf_enq_idx).bits.st.bits.succeeded  := false.B
 
       assert (st_enq_idx === io.core.dis_uops(w).bits.stq_idx, "[lsu] mismatch enq store tag.")
-      assert (!stq(st_enq_idx).valid, "[lsu] Enqueuing uop is overwriting stq entries")
+      assert (!buf(buf_enq_idx).bits.st.valid, "[lsu] Enqueuing uop is overwriting stq entries")
     }
 
-    ld_enq_idx = Mux(dis_ld_val, WrapInc(ld_enq_idx, numLdqEntries),
-                                 ld_enq_idx)
+    // ld_enq_idx = Mux(dis_ld_val, WrapInc(ld_enq_idx, numLdqEntries),
+    //                              ld_enq_idx)
 
-    next_live_store_mask = Mux(dis_st_val, next_live_store_mask | (1.U << st_enq_idx),
-                                           next_live_store_mask)
-    st_enq_idx = Mux(dis_st_val, WrapInc(st_enq_idx, numStqEntries),
-                                 st_enq_idx)
+    // next_live_store_mask = Mux(dis_st_val, next_live_store_mask | (1.U << st_enq_idx),
+    //                                        next_live_store_mask)
+    // st_enq_idx = Mux(dis_st_val, WrapInc(st_enq_idx, numStqEntries),
+    //                              st_enq_idx)
 
-    assert(!(dis_ld_val && dis_st_val), "A UOP is trying to go into both the LDQ and the STQ")
+    buf_enq_idx = WrapInc(buf_enq_idx, numLdqEntries)
+                                
+    // assert(!(dis_ld_val && dis_st_val), "A UOP is trying to go into both the LDQ and the STQ")
   }
 
-  ldq_tail := ld_enq_idx
-  stq_tail := st_enq_idx
+  // ldq_tail := ld_enq_idx
+  // stq_tail := st_enq_idx
+  buf_tail := buf_enq_idx
 
   io.dmem.force_order   := io.core.fence_dmem
-  io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered
+  io.core.fencei_rdy    := !buf_nonempty && io.dmem.ordered
 
 
   //-------------------------------------------------------------
@@ -394,45 +420,51 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Don't wakeup a load if we just sent it last cycle or two cycles ago
   // The block_load_mask may be wrong, but the executing_load mask must be accurate
-  val block_load_mask    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
-  val p1_block_load_mask = RegNext(block_load_mask)
-  val p2_block_load_mask = RegNext(p1_block_load_mask)
+  // val block_load_mask    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
+  // val p1_block_load_mask = RegNext(block_load_mask)
+  // val p2_block_load_mask = RegNext(p1_block_load_mask)
 
  // Prioritize emptying the store queue when it is almost full
-  val stq_almost_full = RegNext(WrapInc(WrapInc(st_enq_idx, numStqEntries), numStqEntries) === stq_head ||
-                                WrapInc(st_enq_idx, numStqEntries) === stq_head)
+  // val stq_almost_full = RegNext(WrapInc(WrapInc(st_enq_idx, numStqEntries), numStqEntries) === stq_head ||
+  //                               WrapInc(st_enq_idx, numStqEntries) === stq_head)
 
   // The store at the commit head needs the DCache to appear ordered
   // Delay firing load wakeups and retries now
-  val store_needs_order = WireInit(false.B)
+  // val store_needs_order = WireInit(false.B)
 
-  val ldq_incoming_idx = widthMap(i => exe_req(i).bits.uop.ldq_idx)
-  val ldq_incoming_e   = widthMap(i => ldq(ldq_incoming_idx(i)))
+  val ldq_incoming_idx = widthMap(i => exe_req(i).bits.uop.buf_idx)
+  val ldq_incoming_e   = widthMap(i => buf(ldq_incoming_idx(i)))
 
-  val stq_incoming_idx = widthMap(i => exe_req(i).bits.uop.stq_idx)
-  val stq_incoming_e   = widthMap(i => stq(stq_incoming_idx(i)))
+  val stq_incoming_idx = widthMap(i => exe_req(i).bits.uop.buf_idx)
+  val stq_incoming_e   = widthMap(i => buf(stq_incoming_idx(i)))
+  val buf_incoming_idx = widthMap(i => exe_req(i).bits.uop.buf_idx)
+  val buf_incoming_e   = widthMap(i => stq(buf_incoming_idx(i)))
 
-  val ldq_retry_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i => {
-    val e = ldq(i).bits
-    val block = block_load_mask(i) || p1_block_load_mask(i)
-    e.addr.valid && e.addr_is_virtual && !block
-  }), ldq_head))
-  val ldq_retry_e            = ldq(ldq_retry_idx)
+  // val ldq_retry_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i => {
+  //   val e = ldq(i).bits
+  //   val block = block_load_mask(i) || p1_block_load_mask(i)
+  //   e.addr.valid && e.addr_is_virtual && !block
+  // }), ldq_head))
 
-  val stq_retry_idx = RegNext(AgePriorityEncoder((0 until numStqEntries).map(i => {
-    val e = stq(i).bits
-    e.addr.valid && e.addr_is_virtual
-  }), stq_commit_head))
-  val stq_retry_e   = stq(stq_retry_idx)
+  //SM: if a load needs to retry, it must be the one at queue head
+  val ldq_retry_e            = buf(buf_head)
 
-  val stq_commit_e  = stq(stq_execute_head)
+  // val stq_retry_idx = RegNext(AgePriorityEncoder((0 until numStqEntries).map(i => {
+  //   val e = stq(i).bits
+  //   e.addr.valid && e.addr_is_virtual
+  // }), stq_commit_head))
 
-  val ldq_wakeup_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i=> {
-    val e = ldq(i).bits
-    val block = block_load_mask(i) || p1_block_load_mask(i)
-    e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
-  }), ldq_head))
-  val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
+  //SM: if a store needs to retry, it must be the one at queue head
+  val stq_retry_e   = buf(buf_head)
+
+  val stq_commit_e  = buf(buf_head)
+
+  // val ldq_wakeup_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i=> {
+  //   val e = ldq(i).bits
+  //   val block = block_load_mask(i) || p1_block_load_mask(i)
+  //   e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
+  // }), ldq_head))
+  val ldq_wakeup_e   = buf(buf_head)
 
   // -----------------------
   // Determine what can fire
@@ -462,7 +494,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Can we retry a load that missed in the TLB
   val can_fire_load_retry    = widthMap(w =>
-                               ( ldq_retry_e.valid                            &&
+                               ( buf(buf_head).bits.is_ld                     &&
+                                 ldq_retry_e.valid                            &&
                                  ldq_retry_e.bits.addr.valid                  &&
                                  ldq_retry_e.bits.addr_is_virtual             &&
                                 !p1_block_load_mask(ldq_retry_idx)            &&
@@ -475,7 +508,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Can we retry a store addrgen that missed in the TLB
   // - Weird edge case when sta_retry and std_incoming for same entry in same cycle. Delay this
   val can_fire_sta_retry     = widthMap(w =>
-                               ( stq_retry_e.valid                            &&
+                               ( !buf(buf_head).bits.is_ld                    &&
+                                 stq_retry_e.valid                            &&
                                  stq_retry_e.bits.addr.valid                  &&
                                  stq_retry_e.bits.addr_is_virtual             &&
                                  (w == memWidth-1).B                          &&
@@ -486,7 +520,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                ))
   // Can we commit a store
   val can_fire_store_commit  = widthMap(w =>
-                               ( stq_commit_e.valid                           &&
+                               ( !buf(buf_head).bits.is_ld                    &&
+                                 stq_commit_e.valid                           &&
                                 !stq_commit_e.bits.uop.is_fence               &&
                                 !mem_xcpt_valid                               &&
                                 !stq_commit_e.bits.uop.exception              &&
@@ -499,7 +534,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Can we wakeup a load that was nack'd
   val block_load_wakeup = WireInit(false.B)
   val can_fire_load_wakeup = widthMap(w =>
-                             ( ldq_wakeup_e.valid                                      &&
+                             ( buf(buf_head).bits.is_ld                                &&
+                               ldq_wakeup_e.valid                                      &&
                                ldq_wakeup_e.bits.addr.valid                            &&
                               !ldq_wakeup_e.bits.succeeded                             &&
                               !ldq_wakeup_e.bits.addr_is_virtual                       &&
@@ -519,6 +555,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Can we fire a hellacache request that the dcache nack'd
   val can_fire_hella_wakeup    = WireInit(widthMap(w => false.B)) // This is assigned to in the hellashim controller
+
+  //SM: load and store process in order, no need to decide any precedence
 
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
@@ -564,28 +602,28 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false) //     , DC
 
 
-    assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
+  //   assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
 
-    when (will_fire_load_wakeup(w)) {
-      block_load_mask(ldq_wakeup_idx)           := true.B
-    } .elsewhen (will_fire_load_incoming(w)) {
-      block_load_mask(exe_req(w).bits.uop.ldq_idx) := true.B
-    } .elsewhen (will_fire_load_retry(w)) {
-      block_load_mask(ldq_retry_idx)            := true.B
-    }
+  //   when (will_fire_load_wakeup(w)) {
+  //     block_load_mask(ldq_wakeup_idx)           := true.B
+  //   } .elsewhen (will_fire_load_incoming(w)) {
+  //     block_load_mask(exe_req(w).bits.uop.ldq_idx) := true.B
+  //   } .elsewhen (will_fire_load_retry(w)) {
+  //     block_load_mask(ldq_retry_idx)            := true.B
+  //   }
     exe_tlb_valid(w) := !tlb_avail
-  }
-  assert((memWidth == 1).B ||
-    (!(will_fire_sfence.reduce(_||_) && !will_fire_sfence.reduce(_&&_)) &&
-     !will_fire_hella_incoming.reduce(_&&_) &&
-     !will_fire_hella_wakeup.reduce(_&&_)   &&
-     !will_fire_load_retry.reduce(_&&_)     &&
-     !will_fire_sta_retry.reduce(_&&_)      &&
-     !will_fire_store_commit.reduce(_&&_)   &&
-     !will_fire_load_wakeup.reduce(_&&_)),
-    "Some operations is proceeding down multiple pipes")
+  // }
+  // assert((memWidth == 1).B ||
+  //   (!(will_fire_sfence.reduce(_||_) && !will_fire_sfence.reduce(_&&_)) &&
+  //    !will_fire_hella_incoming.reduce(_&&_) &&
+  //    !will_fire_hella_wakeup.reduce(_&&_)   &&
+  //    !will_fire_load_retry.reduce(_&&_)     &&
+  //    !will_fire_sta_retry.reduce(_&&_)      &&
+  //    !will_fire_store_commit.reduce(_&&_)   &&
+  //    !will_fire_load_wakeup.reduce(_&&_)),
+  //   "Some operations is proceeding down multiple pipes")
 
-  require(memWidth <= 2)
+  // require(memWidth <= 2)
 
   //--------------------------------------------
   // TLB Access
@@ -715,21 +753,22 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   for (w <- 0 until memWidth) {
     assert (exe_tlb_paddr(w) === dtlb.io.resp(w).paddr || exe_req(w).bits.sfence.valid, "[lsu] paddrs should match.")
 
-    when (mem_xcpt_valids(w))
-    {
-      assert(RegNext(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) ||
-        will_fire_load_retry(w) || will_fire_sta_retry(w)))
-      // Technically only faulting AMOs need this
-      assert(mem_xcpt_uops(w).uses_ldq ^ mem_xcpt_uops(w).uses_stq)
-      when (mem_xcpt_uops(w).uses_ldq)
-      {
-        ldq(mem_xcpt_uops(w).ldq_idx).bits.uop.exception := true.B
-      }
-        .otherwise
-      {
-        stq(mem_xcpt_uops(w).stq_idx).bits.uop.exception := true.B
-      }
-    }
+    // SM: ignore this exception for now 
+    // when (mem_xcpt_valids(w))
+    // {
+    //   assert(RegNext(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) ||
+    //     will_fire_load_retry(w) || will_fire_sta_retry(w)))
+    //   // Technically only faulting AMOs need this
+    //   assert(mem_xcpt_uops(w).uses_ldq ^ mem_xcpt_uops(w).uses_stq)
+    //   when (mem_xcpt_uops(w).uses_ldq)
+    //   {
+    //     ldq(mem_xcpt_uops(w).ldq_idx).bits.uop.exception := true.B
+    //   }
+    //     .otherwise
+    //   {
+    //     stq(mem_xcpt_uops(w).stq_idx).bits.uop.exception := true.B
+    //   }
+    // }
   }
 
 

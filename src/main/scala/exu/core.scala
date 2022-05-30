@@ -694,7 +694,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
                       || io.lsu.stq_full(w) && dis_uops(w).uses_stq
                       || !dispatcher.io.ren_uops(w).ready
                       || wait_for_empty_pipeline(w)
-                      || wait_for_rocc(w)
+                   stq_idxusedddd   || wait_for_rocc(w)
                       || dis_prior_slot_unique(w)
                       || dis_rocc_alloc_stall(w)
                       || brupdate.b1.mispredict_mask =/= 0.U
@@ -713,8 +713,9 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
 
   for (w <- 0 until coreWidth) {
     // Dispatching instructions request load/store queue entries when they can proceed.
-    dis_uops(w).ldq_idx := io.lsu.dis_ldq_idx(w)
-    dis_uops(w).stq_idx := io.lsu.dis_stq_idx(w)
+    // dis_uops(w).ldq_idx := io.lsu.dis_ldq_idx(w)
+    // dis_uops(w).stq_idx := io.lsu.dis_stq_idx(w)
+    dis_uops(w).buf_idx := io.lsu.dis_buf_idx(w)
   }
 
   //-------------------------------------------------------------
